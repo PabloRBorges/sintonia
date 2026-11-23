@@ -4,21 +4,41 @@ Casais respondem a mesma pergunta, cada um no seu celular. Resposta igual vale p
 
 ## Rodar
 
-    node server.js        # Node 18+, sem dependências
+    npm install
+    node server.js        # Node 18+
     # abre em http://localhost:3000
 
 Ou com Docker:
 
     docker build -t sintonia . && docker run -p 3000:3000 sintonia
 
-## Colocar online (Render, plano gratuito)
+## Onde os jogos são gravados
 
-1. Suba esta pasta para um repositório no GitHub.
-2. Em render.com: New > Web Service > escolha o repositório.
-3. Runtime Node, Start Command `node server.js` (o `render.yaml` já traz isso).
+O estado fica em memória e é gravado a cada mudança. Ao subir, o servidor recarrega os jogos.
+A escolha é por variável de ambiente:
 
-Qualquer host que rode Node ou um contêiner serve (Railway, Fly.io, Cloud Run, Kubernetes).
-Use **uma única instância**: o estado fica em memória e as atualizações chegam por SSE.
+| Variável | Armazenamento |
+| --- | --- |
+| `DATABASE_URL` | PostgreSQL. Cria a tabela `sintonia_rooms` sozinho (uma linha por jogo, estado em JSONB). |
+| `DATA_DIR` | Arquivos JSON em `DATA_DIR/rooms/CODIGO.json`. |
+| nenhuma | Só memória: reiniciar apaga tudo. |
+
+`GET /healthz` mostra o armazenamento em uso no campo `storage`. Se o banco não responder na
+subida, o servidor avisa no log e segue em memória.
+
+Cada jogo guarda placar, casais, jogadores, lista de perguntas, a pergunta aberta e um `history`
+com todas as rodadas reveladas (pergunta, resposta de cada pessoa e pontos dados).
+
+`ROOM_TTL_HOURS` define após quantas horas sem uso um jogo é apagado (padrão: 168, sete dias).
+
+## Colocar online no Render
+
+1. New > Web Service > escolha o repositório. Build Command `npm install`, Start Command `node server.js`.
+2. Crie um PostgreSQL (no próprio Render ou em outro provedor) e copie a URL de conexão.
+3. No serviço web: Environment > adicione `DATABASE_URL` com essa URL.
+
+O disco de um Web Service do Render é apagado a cada deploy ou reinício, então `DATA_DIR` só
+persiste ali com um Persistent Disk montado. Use **uma única instância**: as atualizações chegam por SSE.
 
 ## Como funciona
 
@@ -28,7 +48,7 @@ Use **uma única instância**: o estado fica em memória e as atualizações che
 - Só então as respostas aparecem para todos. Casal completo com respostas iguais ganha os pontos da pergunta.
 - O admin pode ajustar pontos (+/−), remover jogadores, criar perguntas e zerar o placar.
 
-## Limites desta versão de teste
+## Limites
 
-- Reiniciar o servidor apaga os jogos (sem banco de dados). Jogos parados somem após 12 h.
-- No plano gratuito do Render o serviço dorme sem tráfego e o primeiro acesso demora.
+- Uma única instância (o estado ativo fica na memória do processo).
+- Uma gravação é feita até 250 ms depois de cada mudança; uma queda brusca nesse intervalo perde a última ação.

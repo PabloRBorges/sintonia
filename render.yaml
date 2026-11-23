@@ -3,6 +3,8 @@ services:
     name: sintonia
     runtime: node
     plan: free
-    buildCommand: "true"
+    buildCommand: npm install
     startCommand: node server.js
     healthCheckPath: /healthz
+    # Para gravar os jogos, defina DATABASE_URL (PostgreSQL) nas variáveis de
+    # ambiente do serviço. Sem ela, o estado fica só em memória.
