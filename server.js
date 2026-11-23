@@ -1,15 +1,54 @@
-// Sintonia — jogo de casais. Servidor único, sem dependências (Node >= 18).
-// Estado em memória: reiniciar o processo apaga os jogos (ok para testes).
+// Sintonia — jogo de casais. Servidor único (Node >= 18).
+// O estado vive em memória e é gravado a cada mudança no armazenamento
+// configurado (ver store.js), de onde é recarregado quando o processo sobe.
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const { createStore } = require('./store');
 
 const PORT = process.env.PORT || 3000;
-const ROOM_TTL_MS = 12 * 60 * 60 * 1000;
+const ROOM_TTL_MS = (Number(process.env.ROOM_TTL_HOURS) || 168) * 60 * 60 * 1000;
 const MAX_ROOMS = 500;
 const MAX_PLAYERS = 200;
 const rooms = new Map();
+let store;
+
+// ---------- persistência ----------
+// Cada jogo é gravado inteiro, com um pequeno atraso para juntar mudanças
+// seguidas, e nunca com duas gravações do mesmo jogo ao mesmo tempo.
+const pending = new Map(); // code -> { timer, chain }
+const snapshot = room => { const { clients, ...data } = room; return data; };
+function persist(room, delay = 250) {
+  if (store.kind === 'memory') return;
+  const p = pending.get(room.code) || { timer: null, chain: Promise.resolve() };
+  pending.set(room.code, p);
+  clearTimeout(p.timer);
+  p.timer = setTimeout(() => {
+    p.timer = null;
+    if (!rooms.has(room.code)) return;
+    const data = JSON.parse(JSON.stringify(snapshot(room)));
+    p.chain = p.chain.then(() => store.save(data)).catch(e => console.error(`Falha ao gravar o jogo ${room.code}:`, e.message));
+  }, delay);
+}
+async function flushAll() {
+  const jobs = [];
+  for (const [code, p] of pending) {
+    const room = rooms.get(code);
+    if (p.timer && room) { clearTimeout(p.timer); p.timer = null; p.chain = p.chain.then(() => store.save(snapshot(room))).catch(e => console.error(e.message)); }
+    jobs.push(p.chain);
+  }
+  await Promise.all(jobs);
+}
+function dropRoom(code) {
+  const room = rooms.get(code);
+  if (room) for (const c of room.clients) c.res.end();
+  rooms.delete(code);
+  const p = pending.get(code);
+  if (p) clearTimeout(p.timer);
+  pending.delete(code);
+  store.remove(code).catch(e => console.error(`Falha ao apagar o jogo ${code}:`, e.message));
+}
 
 const DEFAULT_BANK = [
   ['A gente dividiria a sobremesa sem brigar?'],
@@ -69,6 +108,7 @@ function view(room, c) {
 
 function broadcast(room) {
   room.touched = Date.now();
+  persist(room);
   for (const c of room.clients) c.res.write(`data: ${JSON.stringify(view(room, c))}\n\n`);
 }
 
@@ -106,6 +146,10 @@ function adminAction(room, b) {
         }
       }
       room.phase = 'reveal';
+      room.history.push({ round: room.round, at: new Date().toISOString(), question: room.question,
+        answers: Object.values(room.players).map(p => ({ name: p.name, coupleId: p.coupleId, choice: room.answers[p.id] ?? null })),
+        awarded: { ...room.awarded } });
+      if (room.history.length > 500) room.history.shift();
       return;
     }
     case 'next': room.phase = 'lobby'; room.question = null; room.answers = {}; room.awarded = {}; return;
@@ -141,14 +185,15 @@ const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://x');
   const p = url.pathname;
   try {
-    if (p === '/healthz') return send(res, 200, { ok: true, rooms: rooms.size });
+    if (p === '/healthz') return send(res, 200, { ok: true, rooms: rooms.size, storage: store.kind });
 
     if (p === '/api/rooms' && req.method === 'POST') {
       if (rooms.size >= MAX_ROOMS) return send(res, 503, { error: 'Muitos jogos abertos. Tente mais tarde.' });
       const room = { code: newCode(), adminToken: id(16), touched: Date.now(), phase: 'lobby', round: 0,
-        question: null, answers: {}, awarded: {}, couples: {}, players: {}, clients: new Set(),
+        question: null, answers: {}, awarded: {}, couples: {}, players: {}, history: [], clients: new Set(),
         bank: DEFAULT_BANK.map(q => ({ ...q, options: [...q.options] })) };
       rooms.set(room.code, room);
+      persist(room, 0);
       return send(res, 200, { code: room.code, adminToken: room.adminToken });
     }
 
@@ -230,10 +275,25 @@ const server = http.createServer(async (req, res) => {
 
 setInterval(() => {
   const now = Date.now();
-  for (const [code, room] of rooms) if (now - room.touched > ROOM_TTL_MS) {
-    for (const c of room.clients) c.res.end();
-    rooms.delete(code);
-  }
+  for (const [code, room] of rooms) if (now - room.touched > ROOM_TTL_MS) dropRoom(code);
 }, 10 * 60 * 1000).unref();
 
-server.listen(PORT, () => console.log(`Sintonia ouvindo na porta ${PORT}`));
+async function shutdown() {
+  server.close();
+  for (const room of rooms.values()) for (const c of room.clients) c.res.end();
+  try { await flushAll(); await store.close(); } catch (e) { console.error(e.message); }
+  process.exit(0);
+}
+process.on('SIGTERM', shutdown);
+process.on('SIGINT', shutdown);
+
+(async () => {
+  store = await createStore();
+  const now = Date.now();
+  for (const data of await store.loadAll().catch(e => { console.error('Falha ao carregar jogos:', e.message); return []; })) {
+    if (!data || !data.code || !data.adminToken) continue;
+    if (now - (data.touched || 0) > ROOM_TTL_MS) { store.remove(data.code).catch(() => {}); continue; }
+    rooms.set(data.code, { answers: {}, awarded: {}, couples: {}, players: {}, history: [], bank: [], ...data, clients: new Set() });
+  }
+  server.listen(PORT, () => console.log(`Sintonia na porta ${PORT} · armazenamento: ${store.kind} · jogos carregados: ${rooms.size}`));
+})();
